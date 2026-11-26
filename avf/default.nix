@@ -9,38 +9,14 @@
 let
   base = pkgs.fetchgit {
     url = "https://android.googlesource.com/platform/packages/modules/Virtualization/";
-    rev = "android-16.0.0_r3";
-    hash = "sha256-boWayfOI88ejnXZ5yQzYdSuMANJLB5/Wd30ZWtsXuHw=";
+    rev = "android-17.0.0_r1";
+    hash = "sha256-WSdTaT1d6sdguRyi2QeDWOuOVoDNCTq2ZCFcjifV2L0=";
   };
   extraPkgs = pkgs.callPackage ./pkgs.nix { inherit base; };
 
-  serialDevice = "ttyS0";
-
-  mkService = name: {
-    serviceConfig = {
-      ExecStart = "${
-        lib.getExe extraPkgs.android_virt.${name}
-      } --grpc-port-file /mnt/internal/debian_service_port";
-      Type = "simple";
-      Restart = "on-failure";
-      RestartSec = 1;
-      User = "root";
-      Group = "root";
-      StandardOutput = "journal";
-      StandardError = "journal";
-    };
-    wantedBy = [ "multi-user.target" ];
-    wants = [ "network-online.target" ];
-    after = [
-      "network-online.target"
-      "network.target"
-      "mnt-internal.mount"
-    ];
-
-    restartIfChanged = false;
-  };
-
   vmConfig = pkgs.formats.json { };
+
+  ttydSocket = "/run/ttyd/ttyd.sock";
 
   cfg = config.avf;
 in
@@ -125,32 +101,20 @@ with lib;
       };
     };
 
-    /*
-      services.ttyd = {
-        enable = true;
-        enableSSL = true;
-        caFile = = "/mnt/internal/ca.crt";
-        keyFile = "/etc/ttyd/server.key";
-        clientOptions = [ "disableLeaveAlert=true" ];
-        certFile = "/etc/ttyd/server.ct";
-        entrypoint = [ "${pkgs.shadow}/bin/login" "-f" "${cfg.defaultUser}" ];
-        writeable = true;
-      };
-    */
-
-    systemd.package = pkgs.systemd.overrideAttrs (a: {
-      patches = a.patches ++ [
-        ./systemd-esp-type-ignore.patch
-      ];
-    });
-
+    # Android 17 Terminal no longer exposes /mnt/internal (TLS CA for ttyd,
+    # storage balloon port file): ttyd listens on a unix socket and a vsock
+    # bridge publishes it on 7681 for the app to connect to.
     systemd.services.ttyd = {
       serviceConfig = {
-        ExecStart = "${extraPkgs.ttyd}/bin/ttyd --ssl --ssl-cert /etc/ttyd/server.crt --ssl-key /etc/ttyd/server.key --ssl-ca /mnt/internal/ca.crt -t disableLeaveAlert=true -W ${config.services.ttyd.entrypoint} -f ${cfg.defaultUser}";
+        ExecStart = "${extraPkgs.ttyd}/bin/ttyd -i ${ttydSocket} -t disableLeaveAlert=true -W ${config.services.ttyd.entrypoint} -f ${cfg.defaultUser}";
         Type = "simple";
         Restart = "always";
         User = "root";
         Group = "root";
+        RuntimeDirectory =
+          assert lib.hasPrefix "/run/ttyd/" ttydSocket;
+          "ttyd";
+        RuntimeDirectoryMode = "0755";
       };
 
       wantedBy = [ "multi-user.target" ];
@@ -158,39 +122,32 @@ with lib;
       after = [
         "network-online.target"
         "network.target"
-        "mnt-internal.mount"
       ];
 
       restartIfChanged = false;
     };
 
-    systemd.services.avahi_ttyd = {
-      description = "avahi_TTYD";
+    systemd.services.ttyd_vsock_bridge = {
+      description = "VSOCK to UDS Bridge for ttyd";
 
-      after = [
-        "ttyd.service"
-        "avahi-daemon.socket"
-      ];
-      wantedBy = [ "multi-user.target" ];
+      requires = [ "ttyd.service" ];
+      after = [ "ttyd.service" ];
 
       serviceConfig = {
-        ExecStart = "${pkgs.avahi}/bin/avahi-publish-service ttyd _http._tcp 7681";
         Type = "simple";
+        ExecStart = "${pkgs.socat}/bin/socat VSOCK-LISTEN:7681,fork,reuseaddr UNIX-CONNECT:${ttydSocket}";
         Restart = "always";
-        User = "root";
-        Group = "root";
+        RestartSec = 3;
       };
     };
 
-    services.avahi = {
-      enable = true;
-      # Sometimes during startup, Terminal will discover only the IPv6 address
-      # and then only whitelist that one for GRPC.
-      # Remove once this is solved. See #5
-      ipv6 = false;
-      publish = {
-        enable = true;
-        userServices = true;
+    systemd.paths.ttyd_vsock_bridge = {
+      description = "Watch for ttyd socket";
+
+      wantedBy = [ "multi-user.target" ];
+
+      pathConfig = {
+        PathExists = ttydSocket;
       };
     };
 
@@ -220,66 +177,11 @@ with lib;
     ];
 
     boot.growPartition = true;
-    boot.loader.systemd-boot.enable = true;
-    boot.loader.systemd-boot.extraInstallCommands = mkIf (cfg.enableConfigReplace) ''
-      # update vm_config if on live machine
-      if [ -e /mnt/internal/linux ]; then
-        ${pkgs.coreutils}/bin/cp -v ${config.system.build.vmConfig} /tmp/vm_config.json.new
-        ${pkgs.gnused}/bin/sed -i "s/{efi_part_guid}/$(${pkgs.util-linux}/bin/sfdisk --part-uuid /dev/vda 1)/g" /tmp/vm_config.json.new
-        ${pkgs.gnused}/bin/sed -i "s/{root_part_guid}/$(${pkgs.util-linux}/bin/sfdisk --part-uuid /dev/vda 2)/g" /tmp/vm_config.json.new
-        ${pkgs.coreutils}/bin/mv -v /tmp/vm_config.json.new /mnt/internal/linux/vm_config.json
-      fi
-    '';
-
-    # image building needs to know what device to install bootloader on
-    boot.loader.grub.device = "/dev/vda";
-    # Faster boot. User can't access bootloader currently anyways (?)
-    boot.loader.timeout = 0;
-
-    # avf patches only available for 6.1 right now
-    boot.kernelPackages = mkIf (!cfg.useGenericKernel) pkgs.linuxPackages_6_1;
-
-    boot.kernelPatches = mkIf (!cfg.useGenericKernel) [
-      {
-        name = "avf-ballon";
-        patch = "${base}/build/debian/kernel/patches/avf/arm64-balloon.patch";
-        ${
-          if lib.versionAtLeast lib.trivial.release "25.05" then
-            "structuredExtraConfig"
-          else
-            "extraStructuredConfig"
-        } =
-          with lib.kernel; {
-            SND_VIRTIO = module;
-            SND = yes;
-            SOUND = yes;
-          };
-      }
-      {
-        name = "avf-cpufreq";
-        patch = "${base}/build/debian/kernel/patches/avf/virtual-cpufreq.patch";
-        ${
-          if lib.versionAtLeast lib.trivial.release "25.05" then
-            "structuredExtraConfig"
-          else
-            "extraStructuredConfig"
-        } =
-          with lib.kernel; {
-            CPU_FREQ = yes;
-            IKCONFIG = yes;
-            IKCONFIG_PROC = yes;
-          } // (if pkgs.stdenv.targetPlatform.isAarch64 then {
-            ANDROID_V_CPUFREQ_VIRT = yes;
-          } else {});
-      }
-    ];
-
-    boot.kernelParams = [
-      "console=tty1"
-      "console=${serialDevice}"
-    ];
-
-    boot.kernelModules = [ "vhost_vsock" ] ++ lib.optionals cfg.enableGraphics [ "virtio_gpu" ];
+    # Android 17 boots a fixed kernel+initrd (no EFI): hand off to systemd via
+    # the stage-2 init script and skip the initrd entirely.
+    boot.loader.initScript.enable = true;
+    boot.loader.grub.enable = false;
+    boot.initrd.enable = false;
 
     fileSystems = {
       "/" = {
@@ -287,44 +189,14 @@ with lib;
         autoResize = true;
         fsType = "ext4";
       };
-      "/boot" = {
-        device = "/dev/disk/by-label/ESP";
-        fsType = "vfat";
-      };
 
-      "/mnt/internal" = {
-        device = "internal";
-        fsType = "virtiofs";
-      };
       "/mnt/shared" = {
         device = "android";
         fsType = "virtiofs";
       };
-      /*
-        "/mnt/backup" = {
-          device = "/dev/vdb";
-          fsType = "virtiofs";
-        };
-      */
     };
 
-    # from Virtualization/guest/storage_balloon_agent/debian/service
-
-    systemd.services.storage_balloon_agent = mkService "storage_balloon_agent";
-
-    # from Virtualization/guest/forwarder_guest_launcher/debian/service
-
-    systemd.services.forwarder_guest_launcher = mkService "forwarder_guest_launcher" // {
-      path = [
-        extraPkgs.android_virt.forwarder_guest
-        pkgs.bcc
-        "/run/current-system/sw"
-      ];
-    };
-
-    # from Virtualization/guest/shutdown_runner/debian/service
-
-    systemd.services.shutdown_runner = mkService "shutdown_runner";
+    # TODO: Port Virtualization/build/debian/cloud-init_config/root_files/etc/systemd/system/linux_vm_manager.service
 
     services.zram-generator = {
       enable = true;
@@ -351,13 +223,6 @@ with lib;
     security.sudo.wheelNeedsPassword = false;
 
     programs.bcc.enable = true;
-
-    /*
-      programs.bash.interactiveShellInit = ''
-        # Show title of current running command
-        trap 'echo -ne "\e]0;\$BASH_COMMAND\007"' DEBUG
-      '';
-    */
 
     environment.systemPackages = mkIf cfg.enableGraphics (with pkgs; [
       mesa
@@ -395,7 +260,7 @@ with lib;
       };
 
       environment = {
-        LIBGL_DRIVERS_PATH = "${pkgs.mesa.drivers}/lib/dri";
+        LIBGL_DRIVERS_PATH = "${pkgs.weston.drivers}/lib/dri";
         LD_LIBRARY_PATH = "/run/opengl-driver/lib";
       };
     };
@@ -413,10 +278,14 @@ with lib;
     systemd.network.enable = true;
     networking.useNetworkd = true;
     networking.dhcpcd.enable = false;
-    services.resolved.dnssec = "false";
+    services.resolved.settings.Resolve.DNSSEC = "false";
     networking.useDHCP = true;
     networking.firewall.enable = true; # default
     networking.nftables.enable = true;
     networking.firewall.allowedTCPPorts = [ 7681 ];
+
+    # The `rpfilter` chain requires the `nft_fib_inet` kernel module, but we
+    # do not currently install any kernel modules.
+    networking.firewall.checkReversePath = false;
   };
 }
